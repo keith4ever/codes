@@ -1,3 +1,14 @@
+# - Step 1:
+# Implement a fused operation corresponding to average pool 2d (https://pytorch.org/docs/stable/generated/torch.nn.AvgPool2d.html)
+# fused with a GELU activation (https://pytorch.org/docs/stable/generated/torch.nn.GELU.html)
+# templated for float16, and float32, using Triton, OpenCL, CUDA, Metal, or any other GPU shading language of your choice.
+# You may assume an input tensor of size [1, C,H, W], and limit the average pool 2d implementation to consider scalar values for kernel size and stride parameters; you may assume padding = 0. Please consider scalar values of 1, 2, and 3 for support.
+# - Step 2:
+# Add support for 8-bit input mapping to float16 or float32 output, with dequantization performed on-the-fly within the kernel. 8-bit quantization may beimplemented via a simple linear quantization scheme, applied per-channel. For a representative formula, see formula 12 in
+# Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference (https://arxiv.org/pdf/1712.05877)
+# - Step 3:
+# Test your kernels for correctness. Provide discussion on how things may fail in production, guarding against client misuse, quantization scheme, or anything else you find interesting.
+
 import os
 import math
 import torch
