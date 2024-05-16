@@ -9,46 +9,36 @@
 # - Step 3:
 # Test your kernels for correctness. Provide discussion on how things may fail in production, guarding against client misuse, quantization scheme, or anything else you find interesting.
 
+import os
 import math
 import torch
 import torch.nn as nn
 import numpy as np
-import pycuda.driver as cuda
-import pycuda.autoinit
-import pycuda.gpuarray as gpuarray
-from pycuda.compiler import SourceModule
+from numba import cuda
 
-gpu_module = \
-    SourceModule("""
-    #include <math_constants.h>
-                          
-    __global__ void avgpool2d_gelu_dequant(
-                          int kernel_size, int stride, 
-                          float min_value, float scale, 
-                          int ch, int in_height, int in_width, 
-                          int height, int width,
-                          unsigned char *input, float *output)
-    {
-        int idxC = threadIdx.x + blockIdx.x * blockDim.x; 
-        int idxY = threadIdx.y + blockIdx.y * blockDim.y; 
-        int idxX = threadIdx.z + blockIdx.z * blockDim.z; 
-        if( idxC >= ch || idxY >= height || idxX >= width)
-            return; 
-                          
-        int sum = 0;
-        int i = idxY * stride;
-        int j = idxX * stride;
-        for(unsigned char m = 0; m < kernel_size; m++)
-            for(unsigned char n = 0; n < kernel_size; n++){
-                if((i + m) >= in_height || (j + n) >= in_width)
-                    continue; 
-                sum += input[idxC * in_height * in_width + (i + m)*in_width + j + n];
-            }
-        float sum_deq = float((sum * scale) / (kernel_size * kernel_size)) + min_value;
-        output[idxC * height * width + idxY * width + idxX] =
-            0.5 * sum_deq * (1.0 + erff(sum_deq / sqrt(2.0)));
-    }
-""")
+@cuda.jit
+def gpu_compute(kernel_size, stride, min_value, scale, input, output):
+    idxC = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
+    idxY = cuda.threadIdx.y + cuda.blockIdx.y * cuda.blockDim.y
+    idxX = cuda.threadIdx.z + cuda.blockIdx.z * cuda.blockDim.z
+    if idxC >= output.shape[0] or idxY >= output.shape[1] or idxX >= output.shape[2]:
+        return 
+
+    sum:int = 0
+    i = idxY * stride
+    j = idxX * stride
+    # AvgPool2d op
+    for m in range(kernel_size):
+        for n in range(kernel_size):
+            if (i + m) >= input.shape[1] or (j + n) >= input.shape[2]:
+                continue
+            sum += input[idxC, i + m, j + n]
+
+    # dequantize from int8 to float
+    sum_dequant = (sum * scale) / (kernel_size * kernel_size) + min_value
+    # GELU op
+    output[idxC, idxY, idxX] = sum_dequant * (1.0 + math.erf(sum_dequant / math.sqrt(2.0))) / 2.0
+
 
 class AvgPool2dGelu:
     def __init__(self, measure_error=True) -> None:
@@ -56,32 +46,29 @@ class AvgPool2dGelu:
         self.stride:int = 1
         self.quant_error:bool = measure_error
         # self.padding = 0
+        os.environ['NUMBAPRO_LIBDEVICE'] = "/usr/local/cuda/nvvm/libdevice"
+        os.environ['NUMBAPRO_NVVM'] = "/usr/local/cuda/nvvm/lib64/libnvvm.so"
 
-    def forward(self, input, min_value, scale):
+    def forward(self, input: torch.tensor, min_value, scale):
         channel = input.shape[0]
         # out_height = math.floor((input.shape[1] + 2 * self.padding - self.kernel_size) / self.stride + 1)
         # out_width = math.floor((input.shape[2] + 2 * self.padding - self.kernel_size) / self.stride + 1)
         out_height = math.floor((input.shape[1] - self.kernel_size) / self.stride + 1)
         out_width = math.floor((input.shape[2] - self.kernel_size) / self.stride + 1)
         
-        d_input = gpuarray.to_gpu(input)
-        output = np.zeros([channel, out_height, out_width], dtype=np.float32)
-        d_output = cuda.mem_alloc(output.nbytes)
+        d_input = cuda.to_device(input)
+        d_output = cuda.device_array((channel, out_height, out_width), dtype=d_input.dtype) 
 
-        grid = (4, 16, 16)
-        bgrid_c = int((channel + grid[0] - 1) / grid[0])
-        bgrid_y = int((out_height + grid[1] - 1) / grid[1])
-        bgrid_x = int((out_width + grid[2] - 1) / grid[2])
-        block = (bgrid_c, bgrid_y, bgrid_x)
+        threads_per_block = (4, 16, 16)
+        bgrid_c = int((channel + threads_per_block[0] - 1) / threads_per_block[0])
+        bgrid_y = int((out_height + threads_per_block[1] - 1) / threads_per_block[1])
+        bgrid_x = int((out_width + threads_per_block[2] - 1) / threads_per_block[2])
+        blocks_per_grid = (bgrid_c, bgrid_y, bgrid_x)
 
-        avgpool2d_gelu_dequant = gpu_module.get_function("avgpool2d_gelu_dequant")
-        avgpool2d_gelu_dequant(np.int32(self.kernel_size), np.int32(self.stride), 
-                    np.float32(min_value), np.float32(scale), 
-                    np.int32(channel), np.int32(input.shape[1]), np.int32(input.shape[2]), 
-                    np.int32(out_height), np.int32(out_width), d_input, d_output, 
-                    block=block, grid=grid)
-        cuda.memcpy_dtoh(output, d_output)
-        return output
+        gpu_compute[blocks_per_grid, threads_per_block]\
+            (self.kernel_size, self.stride, min_value, scale, d_input, d_output)
+        cuda.synchronize()
+        return d_output.copy_to_host() 
 
     def run(self, kernel_size, stride, channel, height, width, dtype) -> None:
         print(f'**** kernel={kernel_size}, stride={stride}, channel={channel}, \
@@ -95,7 +82,7 @@ class AvgPool2dGelu:
         max_value:dtype = input.max()
         min_value:dtype = input.min()
         scale = (max_value - min_value)/255
-        input_quant = np.rint((input - min_value)/scale).astype(np.int8)
+        input_quant:np.int8 = np.rint((input - min_value)/scale)
 
         output = self.forward(input_quant, min_value, scale)
 
@@ -116,6 +103,7 @@ class AvgPool2dGelu:
 
 
 if __name__ == '__main__':
+    cuda.detect()
     model = AvgPool2dGelu()
 
     model.run(1, 1, 16, 50, 24, np.float32)
