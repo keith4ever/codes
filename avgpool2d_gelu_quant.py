@@ -18,8 +18,7 @@ import pycuda.autoinit
 import pycuda.gpuarray as gpuarray
 from pycuda.compiler import SourceModule
 
-gpu_module = \
-    SourceModule("""
+_kernel_str = """
     #include <math_constants.h>
                           
     __global__ void avgpool2d_gelu_dequant(
@@ -34,21 +33,24 @@ gpu_module = \
         int idxX = threadIdx.z + blockIdx.z * blockDim.z; 
         if( idxC >= ch || idxY >= height || idxX >= width)
             return; 
-                          
+      
         int sum = 0;
         int i = idxY * stride;
         int j = idxX * stride;
+        // AvgPool2d op
         for(unsigned char m = 0; m < kernel_size; m++)
             for(unsigned char n = 0; n < kernel_size; n++){
                 if((i + m) >= in_height || (j + n) >= in_width)
                     continue; 
                 sum += input[idxC * in_height * in_width + (i + m)*in_width + j + n];
             }
+        // dequantize from int8 to float, along with division by kernel_size ^ 2
         float sum_deq = float((sum * scale) / (kernel_size * kernel_size)) + min_value;
+        // GELU op
         output[idxC * height * width + idxY * width + idxX] =
             0.5 * sum_deq * (1.0 + erff(sum_deq / sqrt(2.0)));
     }
-""")
+"""
 
 class AvgPool2dGelu:
     def __init__(self, measure_error=True) -> None:
@@ -74,6 +76,7 @@ class AvgPool2dGelu:
         bgrid_x = int((out_width + grid[2] - 1) / grid[2])
         block = (bgrid_c, bgrid_y, bgrid_x)
 
+        gpu_module = SourceModule(_kernel_str)
         avgpool2d_gelu_dequant = gpu_module.get_function("avgpool2d_gelu_dequant")
         avgpool2d_gelu_dequant(np.int32(self.kernel_size), np.int32(self.stride), 
                     np.float32(min_value), np.float32(scale), 
